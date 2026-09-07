@@ -477,7 +477,7 @@ async def handle_modern_request(
 
     async def watch_disconnect(cancel_scope: anyio.CancelScope) -> None:
         while (await receive()).get("type") != "http.disconnect":
-            pass  # pragma: no cover
+            await anyio.lowlevel.checkpoint()
         cancel_scope.cancel()
 
     async with recv_ch, anyio.create_task_group() as tg:
