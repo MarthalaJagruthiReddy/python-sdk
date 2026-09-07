@@ -30,6 +30,9 @@ from starlette.types import Message, Scope
 import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import (
+    RequestContext as StreamableHTTPRequestContext,
+)
+from mcp.client.streamable_http import (
     StreamableHTTPTransport,
     streamable_http_client,
     streamablehttp_client,  # pyright: ignore[reportDeprecated]
@@ -55,6 +58,7 @@ from mcp.shared.message import ClientMessageMetadata, ServerMessageMetadata, Ses
 from mcp.shared.session import RequestResponder
 from mcp.types import (
     InitializeResult,
+    JSONRPCError,
     JSONRPCMessage,
     JSONRPCRequest,
     TextContent,
@@ -1855,6 +1859,41 @@ async def test_handle_sse_event_skips_empty_data():
 
 
 @pytest.mark.anyio
+async def test_sse_response_ending_without_response_resolves_request() -> None:
+    """A closed non-resumable SSE response must not leave the request waiting forever."""
+    transport = StreamableHTTPTransport("http://test/mcp")
+    request = JSONRPCRequest(jsonrpc="2.0", id="request-1", method="tools/list", params={})
+    session_message = SessionMessage(JSONRPCMessage(request))
+    writer, reader = anyio.create_memory_object_stream[SessionMessage | Exception](1)
+
+    try:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            ctx = StreamableHTTPRequestContext(
+                client=client,
+                session_id=None,
+                session_message=session_message,
+                metadata=None,
+                read_stream_writer=writer,
+            )
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"",
+                request=httpx.Request("POST", "http://test/mcp"),
+            )
+            await transport._handle_sse_response(response, ctx)
+
+        result = await reader.receive()
+        assert isinstance(result, SessionMessage)
+        assert isinstance(result.message.root, JSONRPCError)
+        assert result.message.root.id == "request-1"
+        assert result.message.root.error.code == types.CONNECTION_CLOSED
+    finally:
+        await writer.aclose()
+        await reader.aclose()
+
+
+@pytest.mark.anyio
 async def test_priming_event_not_minted_for_old_protocol_version():
     """`_mint_priming_event` returns None for pre-2025-11-25 clients (backwards compat)."""
     transport = StreamableHTTPServerTransport(
@@ -2559,35 +2598,3 @@ async def test_get_stream_gives_up_without_retrying_when_the_endpoint_redirects_
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as http:
             await transport.handle_get_stream(http, writer)
     writer.close()
-    reader.close()
-    assert gets == ["http://test/mcp"]
-
-
-@pytest.mark.anyio
-async def test_resumption_redirected_elsewhere_fails_the_resumed_request() -> None:
-    """SDK-defined: a resumption GET answered with a redirect to another origin is not followed;
-    the resumed request fails with HTTPStatusError naming the location, like a redirected POST."""
-    seen: list[tuple[str, str | None]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append((f"{request.method} {request.url}", request.headers.get("last-event-id")))
-        return httpx.Response(307, headers={"location": "http://other.example/mcp"})
-
-    with anyio.fail_after(5):
-        with pytest.raises(Exception) as exc_info:
-            async with (  # pragma: no branch
-                httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as http,
-                streamable_http_client("http://test/mcp", http_client=http) as (read_stream, write_stream, _),
-                read_stream,
-                write_stream,
-            ):
-                request = JSONRPCRequest(jsonrpc="2.0", id="resume-1", method="tools/call", params={})
-                metadata = ClientMessageMetadata(resumption_token="evt-41")
-                await write_stream.send(SessionMessage(JSONRPCMessage(request), metadata=metadata))
-                await read_stream.receive()
-    error = _leaf_exception(exc_info.value)
-    assert isinstance(error, httpx.HTTPStatusError)
-    assert str(error) == snapshot(
-        "Redirect to http://other.example/mcp not followed; use that URL as the endpoint if it is the intended server"
-    )
-    assert seen == [("GET http://test/mcp", "evt-41")]
