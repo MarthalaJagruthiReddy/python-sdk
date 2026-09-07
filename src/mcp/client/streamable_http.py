@@ -32,6 +32,7 @@ from mcp.shared._httpx_utils import (
 )
 from mcp.shared.message import ClientMessageMetadata, SessionMessage
 from mcp.types import (
+    CONNECTION_CLOSED,
     ErrorData,
     InitializeResult,
     JSONRPCError,
@@ -426,6 +427,9 @@ class StreamableHTTPTransport:
         """Handle SSE response from the server."""
         last_event_id: str | None = None
         retry_interval_ms: int | None = None
+        original_request_id = None
+        if isinstance(ctx.session_message.message.root, JSONRPCRequest):
+            original_request_id = ctx.session_message.message.root.id
 
         try:
             event_source = EventSource(response)
@@ -456,6 +460,29 @@ class StreamableHTTPTransport:
         if last_event_id is not None:  # pragma: no branch
             logger.info("SSE stream disconnected, reconnecting...")
             await self._handle_reconnection(ctx, last_event_id, retry_interval_ms)
+        else:
+            await self._resolve_abandoned_request(
+                ctx.read_stream_writer,
+                original_request_id,
+                "SSE stream ended without a response",
+            )
+
+    async def _resolve_abandoned_request(
+        self,
+        read_stream_writer: StreamWriter,
+        request_id: RequestId,
+        message: str,
+    ) -> None:
+        """Resolve a request whose response cannot arrive after the stream closes."""
+        error = JSONRPCError(
+            jsonrpc="2.0",
+            id=request_id,
+            error=ErrorData(code=CONNECTION_CLOSED, message=message),
+        )
+        try:
+            await read_stream_writer.send(SessionMessage(JSONRPCMessage(error)))
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            logger.debug("Read stream closed before request could be resolved")
 
     async def _handle_reconnection(
         self,
@@ -468,6 +495,12 @@ class StreamableHTTPTransport:
         # Bail if max retries exceeded
         if attempt >= MAX_RECONNECTION_ATTEMPTS:  # pragma: no cover
             logger.debug(f"Max reconnection attempts ({MAX_RECONNECTION_ATTEMPTS}) exceeded")
+            original_request_id = ctx.session_message.message.root.id
+            await self._resolve_abandoned_request(
+                ctx.read_stream_writer,
+                original_request_id,
+                "SSE stream ended and reconnection attempts were exhausted",
+            )
             return
 
         # Always wait - use server value or default
